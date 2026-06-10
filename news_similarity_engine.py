@@ -6,6 +6,7 @@ import math
 import random
 import re
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -117,7 +118,7 @@ def canonical_url(url: str) -> str:
     )
 
 
-def fetch_html(url: str, timeout: int = 10) -> str:
+def fetch_html(url: str, timeout: int = 6) -> str:
     request = Request(
         url,
         headers={
@@ -174,13 +175,15 @@ def fetch_article(url: str) -> Article:
 def collect_articles(portal_url: str, limit: int = 12) -> list[Article]:
     urls = discover_article_urls(portal_url, limit=limit)
     articles: list[Article] = []
-    for url in urls:
-        try:
-            article = fetch_article(url)
-        except Exception:
-            continue
-        if len(article.text) >= 120:
-            articles.append(article)
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(urls)))) as executor:
+        future_to_url = {executor.submit(fetch_article, url): url for url in urls}
+        for future in as_completed(future_to_url):
+            try:
+                article = future.result()
+            except Exception:
+                continue
+            if len(article.text) >= 120:
+                articles.append(article)
     return articles
 
 
@@ -355,11 +358,11 @@ def train_word2vec(tokens_by_doc: list[list[str]]):
 
 def train_simple_skipgram(
     tokens_by_doc: list[list[str]],
-    vector_size: int = 40,
+    vector_size: int = 30,
     window: int = 3,
-    epochs: int = 120,
+    epochs: int = 45,
     learning_rate: float = 0.035,
-    negative_samples: int = 4,
+    negative_samples: int = 2,
 ) -> SimpleWord2Vec | None:
     vocabulary = sorted({token for doc in tokens_by_doc for token in doc})
     if len(vocabulary) < 2:
