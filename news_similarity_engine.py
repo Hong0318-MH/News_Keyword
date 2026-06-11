@@ -23,6 +23,27 @@ KOREAN_STOPWORDS = {
     "및", "말하", "전하", "설명", "설명했다", "강조", "예정", "계획", "기준", "현재", "최근", "이날",
 }
 
+SIMILARITY_WEIGHTS = {
+    "content_tfidf": 0.54,
+    "title_tfidf": 0.18,
+    "main_keyword_coverage": 0.11,
+    "token_jaccard": 0.05,
+    "word2vec_document": 0.12,
+}
+
+MAIN_KEYWORD_OVERLAP_TOP_N = 20
+MIN_KEYWORD_LENGTH = 2
+MAX_COMPOUND_TOKEN_LENGTH = 12
+COMPOUND_KEYWORD_PARTS = (
+    "인공지능", "생성형", "반도체", "데이터센터", "데이터", "센터", "프로야구",
+    "자연어", "자연어처리", "컴퓨터비전", "클라우드", "서비스", "정책", "교육",
+)
+
+KOREAN_ENDING_SUFFIXES = (
+    "입니다", "합니다", "했다", "한다", "됐다", "된다", "된다며", "라고", "다고", "였다",
+    "했다며", "밝혔다", "밝히고", "설명했다", "강조했다", "전했다", "말했다",
+)
+
 
 @dataclass
 class Article:
@@ -360,34 +381,48 @@ def collect_articles(portal_url: str, limit: int = 12) -> list[Article]:
 
 
 def tokenize(text: str) -> list[str]:
-    try:
-        from kiwipiepy import Kiwi
-
-        kiwi = Kiwi()
-        tokens = []
-        for token in kiwi.tokenize(text):
-            if token.tag.startswith("N") or token.tag == "SL":
-                value = normalize_keyword_token(token.form)
-                if len(value) > 1 and value not in KOREAN_STOPWORDS:
-                    tokens.append(value)
-        return tokens
-    except Exception:
-        rough_tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", text)
-        tokens = []
-        for token in rough_tokens:
-            value = normalize_keyword_token(token)
-            if len(value) > 1 and value not in KOREAN_STOPWORDS:
-                tokens.append(value)
-        return tokens
+    rough_tokens = re.findall(r"[가-힣A-Za-z0-9][가-힣A-Za-z0-9+.#-]*", text)
+    tokens = []
+    for token in rough_tokens:
+        value = normalize_keyword_token(token)
+        if is_keyword_token(value):
+            tokens.append(value)
+            tokens.extend(expand_compound_token(value))
+    return tokens
 
 
 def normalize_keyword_token(token: str) -> str:
-    value = token.strip()
-    for suffix in KOREAN_PARTICLE_SUFFIXES:
+    value = token.strip(" \t\r\n\"'“”‘’()[]{}<>.,!?;:·…")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9+.#-]*", value):
+        return value.upper()
+    for suffix in sorted(KOREAN_PARTICLE_SUFFIXES + KOREAN_ENDING_SUFFIXES, key=len, reverse=True):
         if len(value) > len(suffix) + 1 and value.endswith(suffix):
             value = value[: -len(suffix)]
             break
     return value
+
+
+def is_keyword_token(token: str) -> bool:
+    if len(token) < MIN_KEYWORD_LENGTH:
+        return False
+    if token in KOREAN_STOPWORDS:
+        return False
+    if token.isdigit():
+        return False
+    return bool(re.search(r"[가-힣A-Za-z]", token))
+
+
+def expand_compound_token(token: str) -> list[str]:
+    if not re.fullmatch(r"[가-힣]{4,}", token):
+        return []
+    if len(token) > MAX_COMPOUND_TOKEN_LENGTH:
+        return []
+
+    return [
+        part
+        for part in COMPOUND_KEYWORD_PARTS
+        if part != token and part in token and is_keyword_token(part)
+    ]
 
 
 def compute_tfidf_vectors(articles: list[Article]) -> tuple[list[dict[str, float]], list[list[str]]]:
@@ -437,19 +472,102 @@ def jaccard_similarity(left: Iterable[str], right: Iterable[str]) -> float:
     return len(left_set & right_set) / len(union)
 
 
-def find_main_article(articles: list[Article]) -> tuple[int, list[list[float]], list[dict[str, float]], list[list[str]]]:
+def main_keyword_coverage(
+    main_vector: dict[str, float],
+    candidate_vector: dict[str, float],
+    top_n: int = MAIN_KEYWORD_OVERLAP_TOP_N,
+) -> float:
+    main_terms = sorted(main_vector.items(), key=lambda item: item[1], reverse=True)[:top_n]
+    total_weight = sum(score for _, score in main_terms)
+    if total_weight == 0:
+        return 0.0
+    covered_weight = sum(score for term, score in main_terms if term in candidate_vector)
+    return covered_weight / total_weight
+
+
+def blended_similarity_score(
+    content_score: float,
+    title_score: float,
+    keyword_coverage: float,
+    token_jaccard: float,
+    word2vec_document: float,
+) -> float:
+    return (
+        SIMILARITY_WEIGHTS["content_tfidf"] * content_score
+        + SIMILARITY_WEIGHTS["title_tfidf"] * title_score
+        + SIMILARITY_WEIGHTS["main_keyword_coverage"] * keyword_coverage
+        + SIMILARITY_WEIGHTS["token_jaccard"] * token_jaccard
+        + SIMILARITY_WEIGHTS["word2vec_document"] * word2vec_document
+    )
+
+
+def similarity_components(
+    main_vector: dict[str, float],
+    candidate_vector: dict[str, float],
+    main_title_vector: dict[str, float],
+    candidate_title_vector: dict[str, float],
+    main_tokens: list[str],
+    candidate_tokens: list[str],
+    main_word2vec_vector: list[float] | None = None,
+    candidate_word2vec_vector: list[float] | None = None,
+) -> dict[str, float]:
+    content_score = cosine_similarity(main_vector, candidate_vector)
+    title_score = cosine_similarity(main_title_vector, candidate_title_vector)
+    keyword_coverage = main_keyword_coverage(main_vector, candidate_vector)
+    token_jaccard = jaccard_similarity(main_tokens, candidate_tokens)
+    word2vec_document = (
+        vector_cosine(main_word2vec_vector, candidate_word2vec_vector)
+        if main_word2vec_vector and candidate_word2vec_vector
+        else 0.0
+    )
+    final_score = blended_similarity_score(
+        content_score,
+        title_score,
+        keyword_coverage,
+        token_jaccard,
+        word2vec_document,
+    )
+    return {
+        "final_score": final_score,
+        "content_tfidf": content_score,
+        "title_tfidf": title_score,
+        "main_keyword_coverage": keyword_coverage,
+        "token_jaccard": token_jaccard,
+        "word2vec_document": word2vec_document,
+    }
+
+
+def find_main_article(
+    articles: list[Article],
+) -> tuple[int, list[list[float]], list[dict[str, float]], list[list[str]], list[dict[str, float]], list[list[float]]]:
     vectors, docs = compute_tfidf_vectors(articles)
+    title_vectors, _ = compute_tfidf_vectors(
+        [Article(title=article.title, url=article.url, text="") for article in articles]
+    )
+    word2vec_vectors = document_word2vec_vectors(docs)
     matrix = [[0.0 for _ in articles] for _ in articles]
     for i, left in enumerate(vectors):
         for j, right in enumerate(vectors):
-            matrix[i][j] = 1.0 if i == j else cosine_similarity(left, right)
+            if i == j:
+                matrix[i][j] = 1.0
+            else:
+                matrix[i][j] = similarity_components(
+                    left,
+                    right,
+                    title_vectors[i],
+                    title_vectors[j],
+                    docs[i],
+                    docs[j],
+                    word2vec_vectors[i],
+                    word2vec_vectors[j],
+                )["final_score"]
 
     centrality = []
     for i, row in enumerate(matrix):
         others = [score for j, score in enumerate(row) if i != j]
         centrality.append(sum(others) / max(1, len(others)))
     main_index = max(range(len(articles)), key=lambda index: centrality[index])
-    return main_index, matrix, vectors, docs
+    return main_index, matrix, vectors, docs, title_vectors, word2vec_vectors
 
 
 def rank_by_similarity(articles: list[Article]) -> tuple[Article, list[RankedArticle], dict[str, object]]:
@@ -458,11 +576,23 @@ def rank_by_similarity(articles: list[Article]) -> tuple[Article, list[RankedArt
     if len(articles) == 1:
         return articles[0], [], {"method": "single_article"}
 
-    main_index, matrix, vectors, docs = find_main_article(articles)
+    main_index, matrix, vectors, docs, title_vectors, word2vec_vectors = find_main_article(articles)
     ranked = []
+    score_components = {}
     for index, article in enumerate(articles):
         if index == main_index:
             continue
+        components = similarity_components(
+            vectors[main_index],
+            vectors[index],
+            title_vectors[main_index],
+            title_vectors[index],
+            docs[main_index],
+            docs[index],
+            word2vec_vectors[main_index],
+            word2vec_vectors[index],
+        )
+        score_components[article.title] = components
         ranked.append(RankedArticle(article=article, similarity=matrix[main_index][index]))
     ranked.sort(key=lambda item: item.similarity, reverse=True)
 
@@ -472,9 +602,11 @@ def rank_by_similarity(articles: list[Article]) -> tuple[Article, list[RankedArt
         if index != main_index
     }
     metadata = {
-        "method": "TF-IDF cosine similarity",
+        "method": "blended TF-IDF, title, keyword coverage, Jaccard, and Word2Vec document similarity",
+        "similarity_weights": SIMILARITY_WEIGHTS,
         "main_index": main_index,
         "tfidf_matrix": matrix,
+        "score_components": score_components,
         "jaccard_scores": jaccard_scores,
         "docs": docs,
         "vectors": vectors,
@@ -494,11 +626,26 @@ def rank_against_main_article(
     ]
     articles = [main_article, *candidates]
     vectors, docs = compute_tfidf_vectors(articles)
+    title_vectors, _ = compute_tfidf_vectors(
+        [Article(title=article.title, url=article.url, text="") for article in articles]
+    )
+    word2vec_vectors = document_word2vec_vectors(docs)
     main_vector = vectors[0]
-    ranked = [
-        RankedArticle(article=article, similarity=cosine_similarity(main_vector, vectors[index]))
-        for index, article in enumerate(articles[1:], start=1)
-    ]
+    ranked = []
+    score_components = {}
+    for index, article in enumerate(articles[1:], start=1):
+        components = similarity_components(
+            main_vector,
+            vectors[index],
+            title_vectors[0],
+            title_vectors[index],
+            docs[0],
+            docs[index],
+            word2vec_vectors[0],
+            word2vec_vectors[index],
+        )
+        score_components[article.title] = components
+        ranked.append(RankedArticle(article=article, similarity=components["final_score"]))
     ranked.sort(key=lambda item: item.similarity, reverse=True)
 
     jaccard_scores = {
@@ -506,8 +653,10 @@ def rank_against_main_article(
         for index, article in enumerate(articles[1:], start=1)
     }
     metadata = {
-        "method": "fixed main article TF-IDF cosine similarity",
+        "method": "fixed main article blended TF-IDF, title, keyword coverage, Jaccard, and Word2Vec document similarity",
+        "similarity_weights": SIMILARITY_WEIGHTS,
         "main_index": 0,
+        "score_components": score_components,
         "jaccard_scores": jaccard_scores,
         "docs": docs,
         "vectors": vectors,
@@ -647,16 +796,48 @@ def train_simple_skipgram(
     return SimpleWord2Vec(input_vectors)
 
 
+def cooccurrence_keyword_neighbors(
+    tokens_by_doc: list[list[str]],
+    keyword: str,
+    top_n: int = 5,
+) -> list[tuple[str, float]]:
+    related_counts: Counter[str] = Counter()
+    keyword_docs = 0
+    for tokens in tokens_by_doc:
+        if keyword not in tokens:
+            continue
+        keyword_docs += 1
+        related_counts.update(token for token in set(tokens) if token != keyword)
+    if keyword_docs == 0:
+        related_counts.update(token for tokens in tokens_by_doc for token in set(tokens) if token != keyword)
+        keyword_docs = max(1, len(tokens_by_doc))
+    return [
+        (word, count / keyword_docs)
+        for word, count in related_counts.most_common(top_n)
+        if is_keyword_token(word)
+    ]
+
+
 def word2vec_keyword_neighbors(tokens_by_doc: list[list[str]], keywords: list[str], top_n: int = 5) -> dict[str, list[tuple[str, float]]]:
     model = train_word2vec(tokens_by_doc)
-    if model is None:
-        return {}
     results: dict[str, list[tuple[str, float]]] = {}
     for keyword in keywords:
-        if hasattr(model, "wv") and keyword in model.wv:
-            results[keyword] = [(word, float(score)) for word, score in model.wv.most_similar(keyword, topn=top_n)]
-        elif keyword in model:
-            results[keyword] = [(word, float(score)) for word, score in model.most_similar(keyword, topn=top_n)]
+        pairs: list[tuple[str, float]] = []
+        if model is not None:
+            if hasattr(model, "wv") and keyword in model.wv:
+                pairs = [(word, float(score)) for word, score in model.wv.most_similar(keyword, topn=top_n)]
+            elif keyword in model:
+                pairs = [(word, float(score)) for word, score in model.most_similar(keyword, topn=top_n)]
+        if len(pairs) < top_n:
+            seen = {word for word, _ in pairs}
+            for word, score in cooccurrence_keyword_neighbors(tokens_by_doc, keyword, top_n=top_n):
+                if word not in seen:
+                    pairs.append((word, score))
+                    seen.add(word)
+                if len(pairs) >= top_n:
+                    break
+        if pairs:
+            results[keyword] = pairs[:top_n]
     return results
 
 
@@ -670,6 +851,36 @@ def most_similar_words(model, word: str, top_n: int = 5) -> list[tuple[str, floa
     if hasattr(model, "wv"):
         return [(other, float(score)) for other, score in model.wv.most_similar(word, topn=top_n)]
     return [(other, float(score)) for other, score in model.most_similar(word, topn=top_n)]
+
+
+def word_vector(model, word: str) -> list[float] | None:
+    if model is None or not contains_word(model, word):
+        return None
+    if hasattr(model, "wv"):
+        return [float(value) for value in model.wv[word]]
+    return [float(value) for value in model.vectors[word]]
+
+
+def document_word2vec_vectors(tokens_by_doc: list[list[str]]) -> list[list[float]]:
+    model = train_word2vec(tokens_by_doc)
+    vectors: list[list[float]] = []
+    for tokens in tokens_by_doc:
+        token_vectors = [
+            vector
+            for token in tokens
+            if (vector := word_vector(model, token)) is not None
+        ]
+        if not token_vectors:
+            vectors.append([])
+            continue
+        size = len(token_vectors[0])
+        vectors.append(
+            [
+                sum(vector[index] for vector in token_vectors) / len(token_vectors)
+                for index in range(size)
+            ]
+        )
+    return vectors
 
 
 def select_word2vec_keywords(
@@ -717,6 +928,41 @@ def select_word2vec_keywords(
     return keywords, keyword_doc_counts, validation
 
 
+def select_ranked_keywords(
+    articles: list[Article],
+    top_n: int = 10,
+    min_doc_count: int = 2,
+) -> tuple[list[tuple[str, float]], dict[str, int], dict[str, dict[str, float]]]:
+    candidates, document_counts, _ = extract_keyword_candidates(
+        articles,
+        min_doc_count=min_doc_count,
+    )
+    if not candidates:
+        return [], {}, {}
+
+    max_tfidf = max(candidates.values()) or 1.0
+    max_doc_count = max(document_counts.get(term, 1) for term in candidates) or 1
+    keyword_scores: dict[str, dict[str, float]] = {}
+    ranked: list[tuple[str, float]] = []
+
+    for term, tfidf_score in candidates.items():
+        tfidf_norm = tfidf_score / max_tfidf
+        doc_norm = document_counts.get(term, 1) / max_doc_count
+        final_score = (tfidf_norm * 0.75) + (doc_norm * 0.25)
+        keyword_scores[term] = {
+            "tfidf_score": tfidf_score,
+            "document_count": float(document_counts.get(term, 0)),
+            "final_score": final_score,
+        }
+        ranked.append((term, final_score))
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    keywords = ranked[:top_n]
+    keyword_doc_counts = {term: document_counts.get(term, 0) for term, _ in keywords}
+    keyword_scores = {term: keyword_scores[term] for term, _ in keywords}
+    return keywords, keyword_doc_counts, keyword_scores
+
+
 def load_sample_articles(path: str | Path = "sample_articles.json") -> list[Article]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return [Article(title=item["title"], url=item["url"], text=item["text"]) for item in data]
@@ -727,24 +973,28 @@ def analyze_articles(articles: list[Article], keyword_count: int = 10) -> dict[s
     keyword_articles = [item.article for item in ranked]
     if len(keyword_articles) < 2:
         keyword_articles = [main, *keyword_articles]
-    keywords, keyword_doc_counts, word2vec_validation = select_word2vec_keywords(
+    keywords, keyword_doc_counts, keyword_scores = select_ranked_keywords(
         keyword_articles,
         top_n=keyword_count,
         min_doc_count=2 if len(keyword_articles) > 1 else 1,
     )
-    metadata["keyword_source"] = "word2vec_validated_similarity_ranked_articles"
+    _, keyword_docs = compute_tfidf_vectors(keyword_articles)
+    word2vec_neighbors = word2vec_keyword_neighbors(
+        keyword_docs,
+        [word for word, _ in keywords],
+        top_n=5,
+    )
+    metadata["keyword_source"] = "tfidf_doc_frequency_similarity_ranked_articles"
     metadata["keyword_doc_counts"] = keyword_doc_counts
-    metadata["word2vec_validation"] = word2vec_validation
+    metadata["keyword_scores"] = keyword_scores
+    metadata["word2vec_neighbors"] = word2vec_neighbors
     return {
         "main": main,
         "ranked": ranked,
         "keywords": keywords,
         "keyword_doc_counts": keyword_doc_counts,
-        "word2vec_validation": word2vec_validation,
-        "word2vec_neighbors": {
-            word: data["similar_terms"]
-            for word, data in word2vec_validation.items()
-        },
+        "keyword_scores": keyword_scores,
+        "word2vec_neighbors": word2vec_neighbors,
         "metadata": metadata,
     }
 
@@ -758,24 +1008,28 @@ def analyze_against_main(
     keyword_articles = [item.article for item in ranked]
     if len(keyword_articles) < 2:
         keyword_articles = [main, *keyword_articles]
-    keywords, keyword_doc_counts, word2vec_validation = select_word2vec_keywords(
+    keywords, keyword_doc_counts, keyword_scores = select_ranked_keywords(
         keyword_articles,
         top_n=keyword_count,
         min_doc_count=2 if len(keyword_articles) > 1 else 1,
     )
-    metadata["keyword_source"] = "word2vec_validated_similarity_ranked_articles"
+    _, keyword_docs = compute_tfidf_vectors(keyword_articles)
+    word2vec_neighbors = word2vec_keyword_neighbors(
+        keyword_docs,
+        [word for word, _ in keywords],
+        top_n=5,
+    )
+    metadata["keyword_source"] = "tfidf_doc_frequency_similarity_ranked_articles"
     metadata["keyword_doc_counts"] = keyword_doc_counts
-    metadata["word2vec_validation"] = word2vec_validation
+    metadata["keyword_scores"] = keyword_scores
+    metadata["word2vec_neighbors"] = word2vec_neighbors
     return {
         "main": main,
         "ranked": ranked,
         "keywords": keywords,
         "keyword_doc_counts": keyword_doc_counts,
-        "word2vec_validation": word2vec_validation,
-        "word2vec_neighbors": {
-            word: data["similar_terms"]
-            for word, data in word2vec_validation.items()
-        },
+        "keyword_scores": keyword_scores,
+        "word2vec_neighbors": word2vec_neighbors,
         "metadata": metadata,
     }
 
@@ -785,7 +1039,8 @@ def print_analysis(result: dict[str, object]) -> None:
     ranked = result["ranked"]
     keywords = result["keywords"]
     keyword_doc_counts = result.get("keyword_doc_counts", {})
-    word2vec_validation = result.get("word2vec_validation", {})
+    keyword_scores = result.get("keyword_scores", {})
+    word2vec_neighbors = result.get("word2vec_neighbors", {})
     assert isinstance(main, Article)
 
     print(f"[메인 기사] {main.title}")
@@ -794,15 +1049,19 @@ def print_analysis(result: dict[str, object]) -> None:
     print("[유사 기사 순위]")
     for index, item in enumerate(ranked, start=1):
         assert isinstance(item, RankedArticle)
-        print(f"{index}. {item.article.title} - cosine={item.similarity:.4f}")
+        print(f"{index}. {item.article.title} - score={item.similarity:.4f}")
     print()
-    print("[핵심 키워드 - Word2Vec 유사도 검증]")
+    print("[핵심 키워드]")
     for word, score in keywords:
         count = keyword_doc_counts.get(word, "")
-        validation = word2vec_validation.get(word, {})
-        similar_terms = validation.get("similar_terms", [])
-        formatted = ", ".join(f"{other}({similarity:.3f})" for other, similarity in similar_terms[:3])
-        print(f"- {word}: score={score:.4f}, repeated_docs={count}, similar={formatted}")
+        score_data = keyword_scores.get(word, {})
+        tfidf_score = score_data.get("tfidf_score", 0.0)
+        print(f"- {word}: score={score:.4f}, tfidf={tfidf_score:.4f}, repeated_docs={count}")
+    print()
+    print("[Word2Vec 유사 단어]")
+    for word, pairs in word2vec_neighbors.items():
+        formatted = ", ".join(f"{other}({similarity:.3f})" for other, similarity in pairs[:5])
+        print(f"- {word}: {formatted}")
 
 
 def main() -> None:

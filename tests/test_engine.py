@@ -8,6 +8,7 @@ from news_similarity_engine import (
     looks_like_article_url,
     normalize_article_url,
     tokenize,
+    word2vec_keyword_neighbors,
 )
 
 
@@ -36,11 +37,28 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(len(result["ranked"]), 3)
         self.assertGreater(len(result["keywords"]), 0)
         self.assertLessEqual(len(result["keywords"]), 5)
-        self.assertIn("word2vec_validation", result)
+        self.assertIn("keyword_scores", result)
+        self.assertIn("word2vec_neighbors", result)
         self.assertTrue(
             all(result["keyword_doc_counts"][word] >= 2 for word, _ in result["keywords"])
         )
-        self.assertTrue(all(word in result["word2vec_validation"] for word, _ in result["keywords"]))
+        self.assertTrue(all(word in result["keyword_scores"] for word, _ in result["keywords"]))
+        self.assertIsInstance(result["word2vec_neighbors"], dict)
+
+    def test_tokenize_expands_compound_korean_terms(self):
+        tokens = tokenize("인공지능반도체")
+        self.assertIn("인공지능반도체", tokens)
+        self.assertIn("인공지능", tokens)
+        self.assertIn("반도체", tokens)
+
+    def test_word2vec_neighbors_falls_back_to_cooccurrence(self):
+        neighbors = word2vec_keyword_neighbors(
+            [["인공지능", "반도체"], ["인공지능", "데이터센터"]],
+            ["인공지능"],
+            top_n=2,
+        )
+        self.assertIn("인공지능", neighbors)
+        self.assertGreaterEqual(len(neighbors["인공지능"]), 1)
 
     def test_fixed_main_article_ranks_candidates(self):
         articles = load_sample_articles("sample_articles.json")
@@ -48,11 +66,20 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(result["main"].url, "sample://ai-chip-1")
         self.assertEqual(len(result["ranked"]), 3)
         self.assertGreaterEqual(result["ranked"][0].similarity, result["ranked"][-1].similarity)
-        self.assertIn("word2vec_validation", result)
+        components = result["metadata"]["score_components"][result["ranked"][0].article.title]
+        self.assertIn("content_tfidf", components)
+        self.assertIn("title_tfidf", components)
+        self.assertIn("main_keyword_coverage", components)
+        self.assertIn("token_jaccard", components)
+        self.assertIn("word2vec_document", components)
+        self.assertAlmostEqual(result["ranked"][0].similarity, components["final_score"])
+        self.assertIn("keyword_scores", result)
+        self.assertIn("word2vec_neighbors", result)
         self.assertTrue(
             all(result["keyword_doc_counts"][word] >= 2 for word, _ in result["keywords"])
         )
-        self.assertTrue(all(word in result["word2vec_validation"] for word, _ in result["keywords"]))
+        self.assertTrue(all(word in result["keyword_scores"] for word, _ in result["keywords"]))
+        self.assertIsInstance(result["word2vec_neighbors"], dict)
 
     def test_naver_article_url_filter(self):
         article_url = "https://n.news.naver.com/mnews/article/001/0012345678?sid=100"
