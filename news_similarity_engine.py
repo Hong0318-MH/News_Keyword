@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 
@@ -19,6 +19,8 @@ KOREAN_STOPWORDS = {
     "그리고", "그러나", "하지만", "또한", "관련", "대한", "위해", "통해", "이번", "지난", "있는",
     "한다", "했다", "된다", "됐다", "에서", "으로", "에게", "까지", "부터", "보다", "처럼", "기자",
     "뉴스", "사진", "제공", "이라며", "다고", "라고", "것으로", "것이다", "있다", "없는", "등을",
+    "대하", "대해", "밝히", "밝혔", "밝혔다", "밝히고", "이후", "이전", "통한", "위한", "것", "수", "등",
+    "및", "말하", "전하", "설명", "설명했다", "강조", "예정", "계획", "기준", "현재", "최근", "이날",
 }
 
 
@@ -104,6 +106,34 @@ def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+NOISE_TEXT_PATTERNS = (
+    "뉴스 이용 설정",
+    "기사 배열은 자동 클러스터링",
+    "각 언론사의 가장 많이 본 기사",
+    "서비스 정책에 따라",
+    "많이 본 뉴스",
+    "네이버 AI 뉴스 알고리즘",
+    "뉴스 추천 알고리즘",
+    "클립 이슈 NOW",
+    "언론사에서 직접 선별한 이슈",
+    "함께 볼만한",
+    "구독",
+    "공유",
+    "댓글",
+    "무단전재",
+    "재배포 금지",
+    "저작권자",
+    "기자 페이지",
+    "기사제보",
+    "Copyright",
+)
+
+KOREAN_PARTICLE_SUFFIXES = (
+    "으로부터", "에서", "에게", "까지", "부터", "으로", "라고", "다고",
+    "은", "는", "이", "가", "을", "를", "과", "와", "에", "의", "로", "도", "만",
+)
+
+
 def canonical_url(url: str) -> str:
     parsed = urlparse(url)
     return urlunparse(
@@ -116,6 +146,21 @@ def canonical_url(url: str) -> str:
             "",
         )
     )
+
+
+def normalize_article_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host in {"news.naver.com", "n.news.naver.com"}:
+        match = re.search(r"/mnews/article/(\d{3})/(\d+)", parsed.path)
+        if match:
+            return f"https://n.news.naver.com/mnews/article/{match.group(1)}/{match.group(2)}"
+        query = parse_qs(parsed.query)
+        oid = query.get("oid", [""])[0]
+        aid = query.get("aid", [""])[0]
+        if parsed.path == "/main/read.naver" and oid and aid:
+            return f"https://n.news.naver.com/mnews/article/{oid}/{aid}"
+    return canonical_url(url)
 
 
 def fetch_html(url: str, timeout: int = 6) -> str:
@@ -146,10 +191,11 @@ def discover_article_urls(portal_url: str, limit: int = 15) -> list[str]:
     seen: set[str] = set()
     for href, anchor_text in parser.links:
         absolute = urljoin(portal_url, href)
-        if absolute in seen or not looks_like_article_url(absolute, anchor_text):
+        normalized = normalize_article_url(absolute)
+        if normalized in seen or not looks_like_article_url(absolute, anchor_text):
             continue
-        seen.add(absolute)
-        urls.append(absolute)
+        seen.add(normalized)
+        urls.append(normalized)
         if len(urls) >= limit:
             break
     return urls
@@ -161,15 +207,141 @@ def looks_like_article_url(url: str, anchor_text: str) -> bool:
         return False
     if len(anchor_text) < 8:
         return False
-    patterns = ("news", "article", "view", "read", "aid", "sid", "idx", "no=")
-    return any(pattern in url.lower() for pattern in patterns)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    query = parse_qs(parsed.query)
+
+    if host in {"news.naver.com", "n.news.naver.com"}:
+        if re.search(r"/mnews/article/\d{3}/\d+", path):
+            return True
+        return path == "/main/read.naver" and bool(query.get("oid")) and bool(query.get("aid"))
+
+    blocked = ("section", "ranking", "cluster", "photo", "video", "weather", "election", "journalist")
+    if any(part in path for part in blocked):
+        return False
+
+    has_article_word = any(pattern in path for pattern in ("article", "view", "read", "news"))
+    has_identifier = bool(re.search(r"\d{4,}", path)) or any(key in query for key in ("aid", "oid", "id", "idx", "no"))
+    return has_article_word and has_identifier
 
 
 def fetch_article(url: str) -> Article:
-    parser = parse_html(fetch_html(url))
-    title = parser.title or url
-    text = parser.text
-    return Article(title=title, url=url, text=text)
+    html = fetch_html(url)
+    return extract_article_from_html(url, html)
+
+
+def clean_title(title: str) -> str:
+    title = normalize_space(title)
+    title = re.sub(r"\s*[:|-]\s*네이버 뉴스\s*$", "", title)
+    title = re.sub(r"\s*[-|]\s*[^-|]{1,20}\s*$", "", title)
+    return normalize_space(title)
+
+
+def clean_article_text(text: str) -> str:
+    lines = []
+    for raw_line in re.split(r"[\r\n]+", text):
+        line = normalize_space(raw_line)
+        if len(line) < 8:
+            continue
+        if any(pattern in line for pattern in NOISE_TEXT_PATTERNS):
+            continue
+        lines.append(line)
+    text = " ".join(lines)
+    text = re.sub(r"\[[^\]]{1,20}\]", " ", text)
+    text = re.sub(r"\([^)]+기자\)", " ", text)
+    return normalize_space(text)
+
+
+def noise_hit_count(text: str) -> int:
+    return sum(1 for pattern in NOISE_TEXT_PATTERNS if pattern in text)
+
+
+def is_probably_article_text(text: str) -> bool:
+    if len(text) < 120:
+        return False
+    korean_chars = len(re.findall(r"[가-힣]", text))
+    if korean_chars < 60:
+        return False
+    if "뉴스 이용 설정" in text[:120] or "기사 배열은 자동 클러스터링" in text:
+        return False
+    return noise_hit_count(text) < 3
+
+
+def extract_article_from_html(url: str, html: str) -> Article:
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        parser = parse_html(html)
+        return Article(title=clean_title(parser.title or url), url=normalize_article_url(url), text=clean_article_text(parser.text))
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "nav", "footer", "aside", "iframe", "svg"]):
+        tag.decompose()
+
+    title = extract_title_from_soup(soup) or url
+    candidates: list[tuple[int, str]] = []
+    selectors = (
+        "#dic_area",
+        "#newsct_article",
+        ".newsct_article",
+        "#articeBody",
+        "#articleBody",
+        "#articleBodyContents",
+        "[itemprop='articleBody']",
+        "article",
+        ".article_body",
+        ".article-body",
+        ".article_view",
+        ".article-view",
+        ".article_content",
+        ".article-content",
+        ".news_article",
+        ".news-content",
+        ".view_text",
+        ".view_cont",
+        ".article_txt",
+    )
+    for selector in selectors:
+        for node in soup.select(selector):
+            for unwanted in node.select("script, style, noscript, nav, footer, aside, iframe, button"):
+                unwanted.decompose()
+            text = clean_article_text(node.get_text("\n", strip=True))
+            if text:
+                score = len(text) - (noise_hit_count(text) * 500)
+                candidates.append((score, text))
+
+    if candidates:
+        text = max(candidates, key=lambda item: item[0])[1]
+    else:
+        description = extract_meta_from_soup(soup, ("og:description", "twitter:description", "description"))
+        text = clean_article_text(description or soup.get_text("\n", strip=True))
+
+    if not is_probably_article_text(text):
+        description = clean_article_text(extract_meta_from_soup(soup, ("og:description", "twitter:description", "description")))
+        if len(description) > len(text):
+            text = description
+
+    return Article(title=clean_title(title), url=normalize_article_url(url), text=text)
+
+
+def extract_title_from_soup(soup) -> str:
+    title = extract_meta_from_soup(soup, ("og:title", "twitter:title"))
+    if title:
+        return clean_title(title)
+    heading = soup.select_one("h1, .media_end_head_headline, .article_title, #title_area")
+    if heading:
+        return clean_title(heading.get_text(" ", strip=True))
+    if soup.title:
+        return clean_title(soup.title.get_text(" ", strip=True))
+    return ""
+
+
+def extract_meta_from_soup(soup, names: tuple[str, ...]) -> str:
+    for name in names:
+        node = soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
+        if node and node.get("content"):
+            return normalize_space(node["content"])
+    return ""
 
 
 def collect_articles(portal_url: str, limit: int = 12) -> list[Article]:
@@ -182,7 +354,7 @@ def collect_articles(portal_url: str, limit: int = 12) -> list[Article]:
                 article = future.result()
             except Exception:
                 continue
-            if len(article.text) >= 120:
+            if is_probably_article_text(article.text):
                 articles.append(article)
     return articles
 
@@ -194,14 +366,28 @@ def tokenize(text: str) -> list[str]:
         kiwi = Kiwi()
         tokens = []
         for token in kiwi.tokenize(text):
-            if token.tag.startswith(("N", "V", "SL")):
-                value = token.form.strip()
+            if token.tag.startswith("N") or token.tag == "SL":
+                value = normalize_keyword_token(token.form)
                 if len(value) > 1 and value not in KOREAN_STOPWORDS:
                     tokens.append(value)
         return tokens
     except Exception:
         rough_tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", text)
-        return [token for token in rough_tokens if token not in KOREAN_STOPWORDS]
+        tokens = []
+        for token in rough_tokens:
+            value = normalize_keyword_token(token)
+            if len(value) > 1 and value not in KOREAN_STOPWORDS:
+                tokens.append(value)
+        return tokens
+
+
+def normalize_keyword_token(token: str) -> str:
+    value = token.strip()
+    for suffix in KOREAN_PARTICLE_SUFFIXES:
+        if len(value) > len(suffix) + 1 and value.endswith(suffix):
+            value = value[: -len(suffix)]
+            break
+    return value
 
 
 def compute_tfidf_vectors(articles: list[Article]) -> tuple[list[dict[str, float]], list[list[str]]]:
@@ -338,6 +524,56 @@ def extract_keywords(articles: list[Article], top_n: int = 10) -> list[tuple[str
     return sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_n]
 
 
+def extract_repeated_keywords(
+    articles: list[Article],
+    top_n: int = 10,
+    min_doc_count: int = 2,
+) -> tuple[list[tuple[str, float]], dict[str, int]]:
+    vectors, docs = compute_tfidf_vectors(articles)
+    scores: defaultdict[str, float] = defaultdict(float)
+    document_counts: Counter[str] = Counter()
+
+    for vector, doc in zip(vectors, docs):
+        document_counts.update(set(doc))
+        for term, score in vector.items():
+            scores[term] += score
+
+    repeated = [
+        (term, score)
+        for term, score in scores.items()
+        if document_counts[term] >= min_doc_count
+    ]
+    repeated.sort(
+        key=lambda item: (document_counts[item[0]], item[1]),
+        reverse=True,
+    )
+    keywords = repeated[:top_n]
+    return keywords, {term: document_counts[term] for term, _ in keywords}
+
+
+def extract_keyword_candidates(
+    articles: list[Article],
+    min_doc_count: int = 2,
+) -> tuple[dict[str, float], dict[str, int], list[list[str]]]:
+    vectors, docs = compute_tfidf_vectors(articles)
+    scores: defaultdict[str, float] = defaultdict(float)
+    document_counts: Counter[str] = Counter()
+
+    for vector, doc in zip(vectors, docs):
+        document_counts.update(set(doc))
+        for term, score in vector.items():
+            scores[term] += score
+
+    candidates = {
+        term: score
+        for term, score in scores.items()
+        if document_counts[term] >= min_doc_count
+    }
+    if not candidates and min_doc_count > 1:
+        candidates = dict(scores)
+    return candidates, dict(document_counts), docs
+
+
 def train_word2vec(tokens_by_doc: list[list[str]]):
     try:
         from gensim.models import Word2Vec
@@ -424,6 +660,63 @@ def word2vec_keyword_neighbors(tokens_by_doc: list[list[str]], keywords: list[st
     return results
 
 
+def contains_word(model, word: str) -> bool:
+    if hasattr(model, "wv"):
+        return word in model.wv
+    return word in model
+
+
+def most_similar_words(model, word: str, top_n: int = 5) -> list[tuple[str, float]]:
+    if hasattr(model, "wv"):
+        return [(other, float(score)) for other, score in model.wv.most_similar(word, topn=top_n)]
+    return [(other, float(score)) for other, score in model.most_similar(word, topn=top_n)]
+
+
+def select_word2vec_keywords(
+    articles: list[Article],
+    top_n: int = 10,
+    min_doc_count: int = 2,
+) -> tuple[list[tuple[str, float]], dict[str, int], dict[str, dict[str, object]]]:
+    candidates, document_counts, docs = extract_keyword_candidates(
+        articles,
+        min_doc_count=min_doc_count,
+    )
+    if not candidates:
+        return [], {}, {}
+
+    model = train_word2vec(docs)
+    max_tfidf = max(candidates.values()) or 1.0
+    max_doc_count = max(document_counts.get(term, 1) for term in candidates) or 1
+    validation: dict[str, dict[str, object]] = {}
+    ranked: list[tuple[str, float]] = []
+
+    for term, tfidf_score in candidates.items():
+        similar_terms: list[tuple[str, float]] = []
+        word2vec_score = 0.0
+        if model is not None and contains_word(model, term):
+            similar_terms = most_similar_words(model, term, top_n=5)
+            positive_scores = [max(0.0, score) for _, score in similar_terms]
+            if positive_scores:
+                word2vec_score = sum(positive_scores) / len(positive_scores)
+
+        tfidf_norm = tfidf_score / max_tfidf
+        doc_norm = document_counts.get(term, 1) / max_doc_count
+        final_score = (word2vec_score * 0.60) + (tfidf_norm * 0.25) + (doc_norm * 0.15)
+        validation[term] = {
+            "word2vec_score": word2vec_score,
+            "tfidf_score": tfidf_score,
+            "similar_terms": similar_terms,
+            "final_score": final_score,
+        }
+        ranked.append((term, final_score))
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    keywords = ranked[:top_n]
+    keyword_doc_counts = {term: document_counts.get(term, 0) for term, _ in keywords}
+    validation = {term: validation[term] for term, _ in keywords}
+    return keywords, keyword_doc_counts, validation
+
+
 def load_sample_articles(path: str | Path = "sample_articles.json") -> list[Article]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return [Article(title=item["title"], url=item["url"], text=item["text"]) for item in data]
@@ -431,16 +724,27 @@ def load_sample_articles(path: str | Path = "sample_articles.json") -> list[Arti
 
 def analyze_articles(articles: list[Article], keyword_count: int = 10) -> dict[str, object]:
     main, ranked, metadata = rank_by_similarity(articles)
-    keywords = extract_keywords(articles, top_n=keyword_count)
-    tokens_by_doc = metadata.get("docs")
-    if not isinstance(tokens_by_doc, list):
-        _, tokens_by_doc = compute_tfidf_vectors(articles)
-    neighbors = word2vec_keyword_neighbors(tokens_by_doc, [word for word, _ in keywords[:5]])
+    keyword_articles = [item.article for item in ranked]
+    if len(keyword_articles) < 2:
+        keyword_articles = [main, *keyword_articles]
+    keywords, keyword_doc_counts, word2vec_validation = select_word2vec_keywords(
+        keyword_articles,
+        top_n=keyword_count,
+        min_doc_count=2 if len(keyword_articles) > 1 else 1,
+    )
+    metadata["keyword_source"] = "word2vec_validated_similarity_ranked_articles"
+    metadata["keyword_doc_counts"] = keyword_doc_counts
+    metadata["word2vec_validation"] = word2vec_validation
     return {
         "main": main,
         "ranked": ranked,
         "keywords": keywords,
-        "word2vec_neighbors": neighbors,
+        "keyword_doc_counts": keyword_doc_counts,
+        "word2vec_validation": word2vec_validation,
+        "word2vec_neighbors": {
+            word: data["similar_terms"]
+            for word, data in word2vec_validation.items()
+        },
         "metadata": metadata,
     }
 
@@ -451,17 +755,27 @@ def analyze_against_main(
     keyword_count: int = 10,
 ) -> dict[str, object]:
     main, ranked, metadata = rank_against_main_article(main_article, candidate_articles)
-    articles = [main, *[item.article for item in ranked]]
-    keywords = extract_keywords(articles, top_n=keyword_count)
-    tokens_by_doc = metadata.get("docs")
-    if not isinstance(tokens_by_doc, list):
-        _, tokens_by_doc = compute_tfidf_vectors(articles)
-    neighbors = word2vec_keyword_neighbors(tokens_by_doc, [word for word, _ in keywords[:5]])
+    keyword_articles = [item.article for item in ranked]
+    if len(keyword_articles) < 2:
+        keyword_articles = [main, *keyword_articles]
+    keywords, keyword_doc_counts, word2vec_validation = select_word2vec_keywords(
+        keyword_articles,
+        top_n=keyword_count,
+        min_doc_count=2 if len(keyword_articles) > 1 else 1,
+    )
+    metadata["keyword_source"] = "word2vec_validated_similarity_ranked_articles"
+    metadata["keyword_doc_counts"] = keyword_doc_counts
+    metadata["word2vec_validation"] = word2vec_validation
     return {
         "main": main,
         "ranked": ranked,
         "keywords": keywords,
-        "word2vec_neighbors": neighbors,
+        "keyword_doc_counts": keyword_doc_counts,
+        "word2vec_validation": word2vec_validation,
+        "word2vec_neighbors": {
+            word: data["similar_terms"]
+            for word, data in word2vec_validation.items()
+        },
         "metadata": metadata,
     }
 
@@ -470,7 +784,8 @@ def print_analysis(result: dict[str, object]) -> None:
     main = result["main"]
     ranked = result["ranked"]
     keywords = result["keywords"]
-    neighbors = result["word2vec_neighbors"]
+    keyword_doc_counts = result.get("keyword_doc_counts", {})
+    word2vec_validation = result.get("word2vec_validation", {})
     assert isinstance(main, Article)
 
     print(f"[메인 기사] {main.title}")
@@ -481,16 +796,13 @@ def print_analysis(result: dict[str, object]) -> None:
         assert isinstance(item, RankedArticle)
         print(f"{index}. {item.article.title} - cosine={item.similarity:.4f}")
     print()
-    print("[핵심 키워드]")
+    print("[핵심 키워드 - Word2Vec 유사도 검증]")
     for word, score in keywords:
-        print(f"- {word}: {score:.4f}")
-    print()
-    print("[Word2Vec 유사 단어]")
-    if not neighbors:
-        print("학습 가능한 토큰이 부족합니다.")
-    for word, pairs in neighbors.items():
-        formatted = ", ".join(f"{other}({score:.3f})" for other, score in pairs)
-        print(f"- {word}: {formatted}")
+        count = keyword_doc_counts.get(word, "")
+        validation = word2vec_validation.get(word, {})
+        similar_terms = validation.get("similar_terms", [])
+        formatted = ", ".join(f"{other}({similarity:.3f})" for other, similarity in similar_terms[:3])
+        print(f"- {word}: score={score:.4f}, repeated_docs={count}, similar={formatted}")
 
 
 def main() -> None:
